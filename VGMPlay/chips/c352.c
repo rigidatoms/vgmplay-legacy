@@ -18,10 +18,20 @@
 
 //#include "emu.h"
 //#include "streams.h"
+
+#ifdef _WIN32
+#include <io.h>
+#define access _access
+#else
+#include <unistd.h>
+#endif
+
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h> // for memset
 #include <stddef.h> // for NULL
+#include <stdio.h>
 #include "mamedef.h"
 #include "c352.h"
 
@@ -90,12 +100,381 @@ typedef struct {
 
 } C352;
 
+typedef struct{
+    UINT32 wave_origin;
+    UINT32 wave_curr;
+    UINT8 active;
+    UINT8 ch; //pointer
+    UINT16 flags; //need to save
+    UINT16 freq; //important information
+}smpl_search;
+static smpl_search sample_search;
+
+static UINT8 mulaw_remap[256];
+    
+typedef struct{
+    UINT32 wave_origin;
+    UINT32 wave_last;
+    UINT16 flags; //need to save
+    UINT16 freq; //important information
+}tracked_sample;
+
+static tracked_sample tracked_samples[0x80];
+static UINT8 total_tracked = 0;
 
 #define MAX_CHIPS   0x02
 static C352 C352Data[MAX_CHIPS];
 
 static UINT8 MuteAllRear = 0x00;
 
+//static FILE *long_smpl_debug;
+
+static void register_untracked_sample(UINT32 wave_origin, UINT32 wave_last, UINT16 flags, UINT16 freq){
+
+    if(total_tracked == 0){//register sample
+        tracked_samples[0].wave_origin = wave_origin;
+        tracked_samples[0].wave_last = wave_last;
+        tracked_samples[0].flags = flags;
+        tracked_samples[0].freq = freq;
+        total_tracked += 1;
+    }
+    else
+    {
+        if(total_tracked >= 0x80)
+            return;
+        for(int i = 0; i < total_tracked; i++){
+            if(tracked_samples[i].wave_origin == wave_origin){ //don't register, just update
+                tracked_samples[i].wave_last = tracked_samples[i].wave_last > wave_last ?
+                    tracked_samples[i].wave_last : wave_last;
+                return;
+            }
+        }
+        //sample hasn't been registered yet, ok
+        tracked_samples[total_tracked].wave_origin = wave_origin;
+        tracked_samples[total_tracked].wave_last = wave_last;
+        tracked_samples[total_tracked].flags = flags;
+        tracked_samples[total_tracked].freq = freq;
+        total_tracked += 1;
+    }
+
+}
+
+UINT8 linear_to_mulaw(INT16 sample)
+{
+    //this code was borrowed from https://github.com/escrichov/G711/blob/master/g711.c
+    //only relevant modification is the conversion of the scaled magnitude to segment number
+    
+    INT16 mask, seg;
+    UINT8 uval;
+
+    sample = sample >> 2;
+    if (sample >= 0) mask = 0xFF;		
+    else {
+        mask = 0x7F;		
+        sample = -sample;
+    }
+    
+    if (sample > 0x1FDF) 
+        sample = 0x1FDF; //clip magnitude
+    sample += (0x84 >> 2); //literally just 0x21, but it's fine for a small scope program
+    /* Convert the scaled magnitude to segment number. */
+    INT16 test = 0x3f;
+    for(seg = 0; seg < 8; seg++, test = (test << 1)|1)
+    {
+        //this replaces a lookup table and a function a call from the original
+        if (sample <= test)
+            break;
+    }
+    /*
+    * Combine the sign, segment, quantization bits,
+    * and complement the code word.
+    */
+    if (seg >= 8)		/* out of range, return maximum value. */
+        return (UINT8)(0x7F ^ mask);
+    else {
+        uval = (UINT8)(seg << 4) | ((sample >> (seg + 1)) & 0xF);
+        return (uval ^ mask);
+    }
+}
+
+void c352_export_sample(C352* chip, C352_Voice* voice){
+    
+    char filebuf[32];
+	snprintf(filebuf, 32, "c352_%08x.wav", voice->pos);
+    if (access(filebuf, F_OK) == 0)
+        return;
+    FILE *outFile = fopen(filebuf, "wb");
+    if (outFile == NULL) {
+        perror("Error while opening file.");
+        exit(1);
+    }
+
+    C352_Voice v = *voice;
+    
+    int length = 0;
+    UINT8 sample;
+    
+    INT32 loop = -1;
+    size_t header_size = sizeof(RIFFHeader) + sizeof(fmtHeader) + sizeof(dataHeader);
+    if(v.flags & C352_FLG_MULAW){
+        header_size = sizeof(RIFFHeader) + sizeof(nonPCMfmtHeader) + sizeof(factHeader) + sizeof(dataHeader);
+    }
+    fwrite(&loop, 1, header_size, outFile);
+    
+    while (v.flags & C352_FLG_BUSY)
+    {
+        UINT16 pos = v.pos & 0xffff;
+
+        // --- read sample ---
+        sample = (chip->wave[v.pos & chip->wave_mask]);
+        if ((v.flags & C352_FLG_MULAW))
+            sample = mulaw_remap[sample & 0xff];
+        else
+            sample += 0x80;
+            
+        // --- advance position / handle boundaries ---
+        if((v.flags & C352_FLG_LOOP) && (v.flags & C352_FLG_REVERSE))
+        {
+            if(pos == v.wave_end){
+                //v->flags |= C352_FLG_KEYOFF;
+                v.flags &= ~C352_FLG_BUSY;
+            }
+            else
+                v.pos += 1;
+        }
+        else if(pos == v.wave_end)
+        {
+            v.flags &= ~C352_FLG_BUSY;
+            
+        }
+        else
+        {
+            v.pos += (v.flags & C352_FLG_REVERSE) ? -1 : 1;
+        }
+        fwrite(&sample, sizeof(UINT8), 1, outFile);
+        length++;
+    }
+
+    if(length & 1){ //necessary padding for 8-bit PCM when length is odd
+        sample = 0x80;
+        fwrite(&sample, sizeof(UINT8), 1, outFile);
+    }
+
+    //WRITE HEADERS
+    if (v.flags & C352_FLG_LOOP){
+        loop = ((v.pos&0xff0000) | v.wave_loop) - (voice->pos);
+    }
+
+    UINT32 smpl_rate = (UINT32)(v.freq)*(1.3451);
+    
+    smplHeader smpl;
+    strncpy(smpl.subchunk3ID, "smpl", 4);
+    smpl.subchunk3Size = 36 + (loop >= 0) * sizeof(smplLoop);
+    smpl.dwManufacturer = smpl.dwProduct = smpl.dwMIDIPitchFraction =
+        smpl.dwSMPTEFormat = smpl.dwSMPTEOffset = smpl.cbSamplerData = 0;
+    smpl.dwSamplePeriod = (UINT32)(1E9 / smpl_rate);
+    smpl.dwMIDIUnityNote = 60;
+    smpl.cSampleLoops = (loop >= 0);
+    fwrite(&smpl, sizeof(smpl), 1, outFile);
+    
+    if (loop >= 0) {
+        smplLoop L;
+        L.dwIdentifier = 0;
+        L.dwType = (v.flags & C352_FLG_REVERSE);
+        L.dwStart = loop;
+        L.dwEnd = (length)-1;
+        L.dwFraction = 0;
+        L.dwPlayCount = 0;
+        fwrite(&L, sizeof(L), 1, outFile);
+    }
+    
+    RIFFHeader riffHeader;
+    fmtHeader fmtHeader;
+    nonPCMfmtHeader nonPCMfmt;
+    factHeader fact;
+    dataHeader dataHeader;
+    
+    memset(&riffHeader, 0, sizeof(riffHeader));
+    memset(&fmtHeader, 0, sizeof(fmtHeader));
+    memset(&nonPCMfmt, 0, sizeof(nonPCMfmt));
+    memset(&fact, 0, sizeof(fact));
+    memset(&dataHeader, 0, sizeof(dataHeader));
+    
+    strncpy(riffHeader.chunkID, "RIFF", 4);
+    // Total file size minus 8 (ID and Size fields)
+    riffHeader.chunkSize = ftell(outFile) - 8;
+    strncpy(riffHeader.format, "WAVE", 4);
+
+    fseek(outFile, 0, SEEK_SET);
+    fwrite(&riffHeader, sizeof(riffHeader), 1, outFile);
+
+    if (v.flags & C352_FLG_MULAW) {
+        strncpy(nonPCMfmt.subchunk1ID, "fmt ", 4);
+        nonPCMfmt.subchunk1Size = 18;
+        nonPCMfmt.audioFormat = 7;
+        nonPCMfmt.numChannels = 1;
+        nonPCMfmt.sampleRate = smpl_rate;
+        nonPCMfmt.bitsPerSample = 8;
+        nonPCMfmt.byteRate = smpl_rate * nonPCMfmt.numChannels * nonPCMfmt.bitsPerSample / 8;
+        nonPCMfmt.blockAlign = (nonPCMfmt.numChannels * nonPCMfmt.bitsPerSample) / 8;
+        nonPCMfmt.cbSize = 0;
+        fwrite(&nonPCMfmt, sizeof(nonPCMfmt), 1, outFile);
+
+        strncpy(fact.factID, "fact", 4);
+        fact.factSize = 4;
+        fact.dwSampleLength = length;
+        fwrite(&fact, sizeof(fact), 1, outFile);
+    }
+    else {
+        strncpy(fmtHeader.subchunk1ID, "fmt ", 4);
+        fmtHeader.subchunk1Size = 16;
+        fmtHeader.audioFormat = 1;
+        fmtHeader.numChannels = 1;
+        fmtHeader.sampleRate = smpl_rate;
+        fmtHeader.bitsPerSample = 8;
+        fmtHeader.byteRate = smpl_rate * fmtHeader.numChannels * fmtHeader.bitsPerSample / 8;
+        fmtHeader.blockAlign = (fmtHeader.numChannels * fmtHeader.bitsPerSample) / 8;
+        fwrite(&fmtHeader, sizeof(fmtHeader), 1, outFile);
+    }
+    
+    strncpy(dataHeader.subchunk2ID, "data", 4);
+    dataHeader.subchunk2Size = length;
+    fwrite(&dataHeader, sizeof(dataHeader), 1, outFile);
+    
+    fclose(outFile);
+}
+
+void C352_exportLONGsample(C352* chip, UINT32 end_addr){
+
+    char filebuf[32];
+	snprintf(filebuf, 32, "c352_%08x.wav", sample_search.wave_origin);
+    FILE *outFile = fopen(filebuf, "wb");
+    if (outFile == NULL) {
+        perror("Error while opening file.");
+        exit(1);
+    }
+
+    int length = 0;
+    UINT8 sample;
+
+    INT32 loop = -1;
+    size_t header_size = sizeof(RIFFHeader) + sizeof(fmtHeader) + sizeof(dataHeader);
+    if(sample_search.flags & C352_FLG_MULAW){
+        header_size = sizeof(RIFFHeader) + sizeof(nonPCMfmtHeader) + sizeof(factHeader) + sizeof(dataHeader);
+    }
+    fwrite(&loop, 1, header_size, outFile);
+
+    for (UINT32 addr = sample_search.wave_origin; addr <= end_addr; addr++, length++){
+        
+        sample = (chip->wave[addr & chip->wave_mask]);
+        if ((sample_search.flags & C352_FLG_MULAW))
+            sample = mulaw_remap[sample & 0xff];
+        else
+            sample += 0x80;
+
+        fwrite(&sample, 1, 1, outFile);
+    }
+
+    //WRITE HEADERS
+    if(length & 1){ //necessary padding for 8-bit PCM when length is odd
+        sample = 0x80;
+        fwrite(&sample, sizeof(UINT8), 1, outFile);
+    }
+
+    UINT32 smpl_rate = (UINT32)(sample_search.freq)*(1.3451);
+    
+    smplHeader smpl;
+    strncpy(smpl.subchunk3ID, "smpl", 4);
+    smpl.subchunk3Size = 36 + (loop >= 0) * sizeof(smplLoop);
+    smpl.dwManufacturer = smpl.dwProduct = smpl.dwMIDIPitchFraction =
+        smpl.dwSMPTEFormat = smpl.dwSMPTEOffset = smpl.cbSamplerData = 0;
+    smpl.dwSamplePeriod = (UINT32)(1E9 / smpl_rate);
+    smpl.dwMIDIUnityNote = 60;
+    smpl.cSampleLoops = (loop >= 0);
+    fwrite(&smpl, sizeof(smpl), 1, outFile);
+    
+    if (loop >= 0) {
+        smplLoop L;
+        L.dwIdentifier = 0;
+        L.dwType = (sample_search.flags & C352_FLG_REVERSE);
+        L.dwStart = loop;
+        L.dwEnd = (length) - 1;
+        L.dwFraction = 0;
+        L.dwPlayCount = 0;
+        fwrite(&L, sizeof(L), 1, outFile);
+    }
+    
+    RIFFHeader riffHeader;
+    fmtHeader fmtHeader;
+    nonPCMfmtHeader nonPCMfmt;
+    factHeader fact;
+    dataHeader dataHeader;
+    
+    memset(&riffHeader, 0, sizeof(riffHeader));
+    memset(&fmtHeader, 0, sizeof(fmtHeader));
+    memset(&nonPCMfmt, 0, sizeof(nonPCMfmt));
+    memset(&fact, 0, sizeof(fact));
+    memset(&dataHeader, 0, sizeof(dataHeader));
+    
+    strncpy(riffHeader.chunkID, "RIFF", 4);
+    // Total file size minus 8 (ID and Size fields)
+    riffHeader.chunkSize = ftell(outFile) - 8;
+    strncpy(riffHeader.format, "WAVE", 4);
+
+    fseek(outFile, 0, SEEK_SET);
+    fwrite(&riffHeader, sizeof(riffHeader), 1, outFile);
+
+    if (sample_search.flags & C352_FLG_MULAW) {
+        strncpy(nonPCMfmt.subchunk1ID, "fmt ", 4);
+        nonPCMfmt.subchunk1Size = 18;
+        nonPCMfmt.audioFormat = 7;
+        nonPCMfmt.numChannels = 1;
+        nonPCMfmt.sampleRate = smpl_rate;
+        nonPCMfmt.bitsPerSample = 8;
+        nonPCMfmt.byteRate = smpl_rate * nonPCMfmt.numChannels * nonPCMfmt.bitsPerSample / 8;
+        nonPCMfmt.blockAlign = (nonPCMfmt.numChannels * nonPCMfmt.bitsPerSample) / 8;
+        nonPCMfmt.cbSize = 0;
+        fwrite(&nonPCMfmt, sizeof(nonPCMfmt), 1, outFile);
+
+        strncpy(fact.factID, "fact", 4);
+        fact.factSize = 4;
+        fact.dwSampleLength = length;
+        fwrite(&fact, sizeof(fact), 1, outFile);
+    }
+    else {
+        strncpy(fmtHeader.subchunk1ID, "fmt ", 4);
+        fmtHeader.subchunk1Size = 16;
+        fmtHeader.audioFormat = 1;
+        fmtHeader.numChannels = 1;
+        fmtHeader.sampleRate = smpl_rate;
+        fmtHeader.bitsPerSample = 8;
+        fmtHeader.byteRate = smpl_rate * fmtHeader.numChannels * fmtHeader.bitsPerSample / 8;
+        fmtHeader.blockAlign = (fmtHeader.numChannels * fmtHeader.bitsPerSample) / 8;
+        fwrite(&fmtHeader, sizeof(fmtHeader), 1, outFile);
+    }
+    
+    strncpy(dataHeader.subchunk2ID, "data", 4);
+    dataHeader.subchunk2Size = length;
+    fwrite(&dataHeader, sizeof(dataHeader), 1, outFile);
+    
+    fclose(outFile);
+
+}
+
+void export_missing_samples(C352* chip){
+    for(int i = 0; i < total_tracked; i++){
+        char filebuf[32];
+        snprintf(filebuf, 32, "c352_%08x.wav", tracked_samples[i].wave_origin);
+        if (access(filebuf, F_OK) == 0)
+            continue;
+        //reuse sample_search, since it's used in the code,
+        //and I don't feel like touching it again
+        sample_search.wave_origin = tracked_samples[i].wave_origin;
+        sample_search.flags = tracked_samples[i].flags;
+        sample_search.freq = tracked_samples[i].freq;
+        C352_exportLONGsample(chip, tracked_samples[i].wave_last);
+    }
+}
 
 static void C352_fetch_sample(C352 *c, C352_Voice *v)
 {
@@ -137,6 +516,10 @@ static void C352_fetch_sample(C352 *c, C352_Voice *v)
             if((v->flags & C352_FLG_LINK) && (v->flags & C352_FLG_LOOP))
             {
                 v->pos = (v->wave_start<<16) | v->wave_loop;
+                if(sample_search.active && (&(c->v[sample_search.ch]) == v))
+                {    
+                    sample_search.wave_curr = v->pos;
+                }
                 v->flags |= C352_FLG_LOOPHIST;
             }
             else if(v->flags & C352_FLG_LOOP)
@@ -213,6 +596,23 @@ void c352_update(UINT8 ChipID, stream_sample_t **outputs, int samples)
                 if((v->flags & C352_FLG_FILTER) == 0)
                     s = v->last_sample + (v->counter*(v->sample-v->last_sample)>>16);
             }
+            else if(
+                (v->flags & C352_FLG_LINK) 
+                && sample_search.active 
+                && sample_search.ch == j
+                
+            ){
+                register_untracked_sample(
+                    sample_search.wave_origin,
+                    v->pos,
+                    sample_search.flags,
+                    sample_search.freq
+                );
+                
+                sample_search.active = 0;
+                sample_search.ch = 32;
+                sample_search.wave_origin = sample_search.wave_curr = 0;
+            }
 
             if(!c->v[j].mute)
             {
@@ -271,9 +671,17 @@ int device_start_c352(UINT8 ChipID, int clock, int clkdiv)
             j += 8;
         else
             j += 16;
+        mulaw_remap[i] = linear_to_mulaw(c->mulaw_table[i]);
     }
-    for(i=128;i<256;i++)
+    for(i=128;i<256;i++){
         c->mulaw_table[i] = (~c->mulaw_table[i-128])&0xffe0;
+        mulaw_remap[i] = linear_to_mulaw(c->mulaw_table[i]);
+    }
+    //long_smpl_debug = fopen("debug.txt", "w");
+    
+    sample_search.active = 0;
+    sample_search.ch = 32;
+    sample_search.wave_origin = sample_search.wave_curr = 0;
 
     return c->sample_rate_base;
 }
@@ -281,6 +689,9 @@ int device_start_c352(UINT8 ChipID, int clock, int clkdiv)
 void device_stop_c352(UINT8 ChipID)
 {
     C352 *c = &C352Data[ChipID];
+    export_missing_samples(c);
+
+    //fclose(long_smpl_debug);
     
     free(c->wave);
     c->wave = NULL;
@@ -349,8 +760,25 @@ void c352_w(UINT8 ChipID, offs_t address, UINT16 val)
     {
         for(i=0;i<C352_VOICES;i++)
         {
+            if(sample_search.active && (i == sample_search.ch)){
+                UINT16 temp = c->v[i].flags & (C352_FLG_KEYON|C352_FLG_KEYOFF);
+                if(temp){
+                    register_untracked_sample(
+                        sample_search.wave_origin,
+                        c->v[i].pos, 
+                        sample_search.flags,
+                        sample_search.freq
+                    );
+                    //RESET SEARCH
+                    sample_search.active = 0;
+                    sample_search.ch = 32;
+                    sample_search.wave_origin = sample_search.wave_curr = 0;
+
+                }
+            }
             if((c->v[i].flags & C352_FLG_KEYON))
             {
+
                 c->v[i].pos = (c->v[i].wave_bank<<16) | c->v[i].wave_start;
 
                 c->v[i].sample = 0;
@@ -362,6 +790,29 @@ void c352_w(UINT8 ChipID, offs_t address, UINT16 val)
 
                 c->v[i].curr_vol[0] = c->v[i].curr_vol[1] = 0;
                 c->v[i].curr_vol[2] = c->v[i].curr_vol[3] = 0;
+                
+                if(!(c->v[i].flags & C352_FLG_LINK))
+                {
+                    c352_export_sample(c, &(c->v[i]));
+                }
+                else
+                {
+                    char filebuf[32];
+	                snprintf(filebuf, 32, "c352_%08x.wav", c->v[i].pos);
+                    if(access(filebuf, F_OK) != 0) //file doesn't exist? good
+                    {    
+                        if(!sample_search.active){
+                            //c352_dump_linked_sample(c, &(c->v[i]));
+                            sample_search.active = 1; //START!!!
+                            sample_search.ch = i;
+                            sample_search.wave_origin = sample_search.wave_curr = c->v[i].pos;
+                            sample_search.flags = c->v[i].flags;
+                            sample_search.freq = c->v[i].freq;
+                        }
+                    }
+                }
+                
+                
             }
             else if(c->v[i].flags & C352_FLG_KEYOFF)
             {
@@ -427,3 +878,4 @@ void c352_set_options(UINT8 Flags)
     
     return;
 }
+

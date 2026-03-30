@@ -63,4 +63,69 @@ extern stream_sample_t* DUMMYBUF[];
 
 typedef void (*SRATE_CALLBACK)(void*, UINT32);
 
+#pragma pack(push, 1)
+typedef struct {
+    INT8 chunkID[4];
+    UINT32 chunkSize;
+    INT8 format[4];
+} RIFFHeader;
+
+typedef struct {
+    INT8 subchunk1ID[4];
+    UINT32 subchunk1Size;
+    UINT16 audioFormat;
+    UINT16 numChannels;
+    UINT32 sampleRate;
+    UINT32 byteRate;
+    UINT16 blockAlign;
+    UINT16 bitsPerSample;
+} fmtHeader;
+
+typedef struct {
+    INT8 subchunk1ID[4];
+    UINT32 subchunk1Size;
+    UINT16 audioFormat;
+    UINT16 numChannels;
+    UINT32 sampleRate;
+    UINT32 byteRate;
+    UINT16 blockAlign;
+    UINT16 bitsPerSample;
+    UINT16 cbSize; //EQUALS 0
+} nonPCMfmtHeader;
+
+typedef struct {
+    INT8 factID[4]; //"fact"
+    UINT32 factSize; //4
+    UINT32 dwSampleLength; //for mu-law, 1
+} factHeader;
+
+typedef struct {
+    INT8 subchunk2ID[4];
+    UINT32 subchunk2Size;
+} dataHeader;
+
+typedef struct {
+    INT8 subchunk3ID[4];
+    UINT32 subchunk3Size;
+    UINT32 dwManufacturer;
+    UINT32 dwProduct;
+    UINT32 dwSamplePeriod;
+    UINT32 dwMIDIUnityNote;
+    UINT32 dwMIDIPitchFraction;
+    UINT32 dwSMPTEFormat;
+    UINT32 dwSMPTEOffset;
+    UINT32 cSampleLoops;
+    UINT32 cbSamplerData;
+} smplHeader;
+
+typedef struct {
+    UINT32 dwIdentifier;
+    UINT32 dwType;
+    UINT32 dwStart;
+    UINT32 dwEnd;
+    UINT32 dwFraction;
+    UINT32 dwPlayCount;
+} smplLoop;
+#pragma pack(pop)
+
 #endif	// __MAMEDEF_H__

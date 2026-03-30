@@ -44,11 +44,19 @@ Unmapped registers:
 
 
 //#include "emu.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>	// for memset
 #include <stddef.h>	// for NULL
 #include "mamedef.h"
 #include "c140.h"
+
+#ifdef _WIN32
+#include <io.h>
+#define access _access
+#else
+#include <unistd.h>
+#endif
 
 #define MAX_VOICE 24
 
@@ -211,6 +219,137 @@ static long find_sample(c140_state *info, long adrs, long bank, int voice)
 
 	return (newadr);
 }
+
+void c140_extract_sample(c140_state *info, int ch, INT32 freq, char* output){
+
+	if (freq == 0)
+		return;
+
+	VOICE v = info->voi[ch];
+	/* Retrieve base pointer to the sample data */
+	INT8* pSampleData = (INT8*)info->pRom + find_sample(info, v.sample_start, v.bank, ch);
+	UINT8 smpl8bit; 
+	INT16 smpl16bit;
+	INT32 length = v.sample_end - v.sample_start;
+	UINT8 save_as_16bit = (v.mode & 8) && (info->banking_type != C140_TYPE_ASIC219);
+	float pbase=(float)info->baserate / (float)info->sample_rate;
+
+	FILE *outFile = fopen(output, "wb");
+    if (outFile == NULL) {
+        perror("Error while opening file.");
+        exit(1);
+    }
+
+	INT32 loop = -1;
+    size_t header_size = sizeof(RIFFHeader) + sizeof(fmtHeader) + sizeof(dataHeader);
+    fwrite(&loop, 1, header_size, outFile);
+
+	for(int pos = 0; pos < length; pos++){
+		
+		if(save_as_16bit){
+			//save as 16-bit sample (BOUND TO CHANGE)
+			//MAME's implementation says that c219 also has mulaw samples
+			INT16 s = pSampleData[pos];
+			smpl16bit = s>>3;	//signed
+			if(smpl16bit < 0)	
+				smpl16bit = (smpl16bit<<(s&7)) - info->pcmtbl[s&7];
+			else		
+				smpl16bit = (smpl16bit<<(s&7)) + info->pcmtbl[s&7];
+			smpl16bit <<= 3;
+			
+			fwrite(&smpl16bit, 2, 1, outFile);
+		}
+		else{
+			if (info->banking_type == C140_TYPE_ASIC219)
+			{
+				//save as 8-bit sample
+				// pos ^ 1 means bytes are in inverted order, so by doing this you get the correct order
+				smpl8bit = pSampleData[pos ^ 1];
+
+				// Sign + magnitude format
+				if ((v.mode & 1) && (smpl8bit & 0x80))
+					smpl8bit = -(smpl8bit & 0x7f);
+
+				// Sign flip
+				if (v.mode & 0x40)
+					smpl8bit = -smpl8bit;
+			}
+			else
+			{
+				smpl8bit = pSampleData[pos];
+			}
+			smpl8bit += 0x80; //signed to unsigned
+
+			fwrite(&smpl8bit, 1, 1, outFile);
+		}
+	}
+
+	if((save_as_16bit == 0) && (length & 1)){ //necessary padding for 8-bit PCM when length is odd
+        smpl8bit = 0x80;
+        fwrite(&smpl8bit, sizeof(UINT8), 1, outFile);
+    }
+
+	if(v.mode & 0x10) //loop is set
+	{
+		loop = (v.sample_loop - v.sample_start);
+	}
+
+	UINT32 smpl_rate = (UINT32)((float)freq*pbase*0.728332119);
+	
+	smplHeader smpl;
+    strncpy(smpl.subchunk3ID, "smpl", 4);
+    smpl.subchunk3Size = 36 + (loop >= 0) * sizeof(smplLoop);
+    smpl.dwManufacturer = smpl.dwProduct = smpl.dwMIDIPitchFraction =
+        smpl.dwSMPTEFormat = smpl.dwSMPTEOffset = smpl.cbSamplerData = 0;
+    smpl.dwSamplePeriod = (UINT32)(1E9 / smpl_rate);
+    smpl.dwMIDIUnityNote = 60;
+    smpl.cSampleLoops = (loop >= 0);
+    fwrite(&smpl, sizeof(smpl), 1, outFile);
+
+	if (loop >= 0) {
+        smplLoop L;
+        L.dwIdentifier = 0;
+        L.dwType = 0;
+        L.dwStart = loop;
+        L.dwEnd = (length)-1;
+        L.dwFraction = 0;
+        L.dwPlayCount = 0;
+        fwrite(&L, sizeof(L), 1, outFile);
+    }
+
+	RIFFHeader riffHeader;
+    fmtHeader fmtHeader;
+    dataHeader dataHeader;
+
+	memset(&riffHeader, 0, sizeof(riffHeader));
+    memset(&fmtHeader, 0, sizeof(fmtHeader));
+    memset(&dataHeader, 0, sizeof(dataHeader));
+
+	strncpy(riffHeader.chunkID, "RIFF", 4);
+    // Total file size minus 8 (ID and Size fields)
+    riffHeader.chunkSize = ftell(outFile) - 8;
+    strncpy(riffHeader.format, "WAVE", 4);
+
+    fseek(outFile, 0, SEEK_SET);
+    fwrite(&riffHeader, sizeof(riffHeader), 1, outFile);
+
+	strncpy(fmtHeader.subchunk1ID, "fmt ", 4);
+	fmtHeader.subchunk1Size = 16;
+	fmtHeader.audioFormat = 1;
+	fmtHeader.numChannels = 1;
+	fmtHeader.sampleRate = smpl_rate;
+	fmtHeader.bitsPerSample = (save_as_16bit) ? 0x10 : 8;
+	fmtHeader.byteRate = smpl_rate * fmtHeader.numChannels * fmtHeader.bitsPerSample / 8;
+	fmtHeader.blockAlign = (fmtHeader.numChannels * fmtHeader.bitsPerSample) / 8;
+	fwrite(&fmtHeader, sizeof(fmtHeader), 1, outFile);
+
+	strncpy(dataHeader.subchunk2ID, "data", 4);
+    dataHeader.subchunk2Size = length;
+    fwrite(&dataHeader, sizeof(dataHeader), 1, outFile);
+    
+    fclose(outFile);
+
+}
 //WRITE8_DEVICE_HANDLER( c140_w )
 void c140_w(UINT8 ChipID, offs_t offset, UINT8 data)
 {
@@ -266,6 +405,16 @@ void c140_w(UINT8 ChipID, offs_t offset, UINT8 data)
 					v->sample_start = vreg->start_msb*256 + vreg->start_lsb;
 					v->sample_end = vreg->end_msb*256 + vreg->end_lsb;
 				}
+
+				char filebuf[32];
+				char isC219 = info->banking_type == C140_TYPE_ASIC219;
+				if (isC219)
+					snprintf(filebuf, 32, "c219_%08x.wav", v->sample_start);
+				else
+					snprintf(filebuf, 32, "c140_%08x.wav", v->sample_start);
+				if (!(isC219 == C140_TYPE_ASIC219 && vreg->mode & 0x04) && access(filebuf, F_OK) != 0)
+					c140_extract_sample(info, offset>>4, (vreg->frequency_msb << 8) | vreg->frequency_lsb, filebuf);
+				
 			}
 			else
 			{
@@ -306,7 +455,7 @@ void c140_update(UINT8 ChipID, stream_sample_t **outputs, int samples)
 	INT32	frequency,delta,offset,pos;
 	INT32	cnt, voicecnt;
 	INT32	lastdt,prevdt,dltdt;
-	float	pbase=(float)info->baserate*2.0f / (float)info->sample_rate;
+	float	pbase=(float)info->baserate / (float)info->sample_rate;
 
 	INT16	*lmix, *rmix;
 
@@ -510,7 +659,7 @@ int device_start_c140(UINT8 ChipID, int clock, int banking_type)
 	if (clock < 1000000)
 		info->baserate = clock;
 	else
-		info->baserate = clock / 384;	// based on MAME's notes on Namco System II
+		info->baserate = clock / 288;
 	info->sample_rate = info->baserate;
 	if (((CHIP_SAMPLING_MODE & 0x01) && info->sample_rate < CHIP_SAMPLE_RATE) ||
 		CHIP_SAMPLING_MODE == 0x02)
@@ -520,6 +669,8 @@ int device_start_c140(UINT8 ChipID, int clock, int banking_type)
 
 	//info->banking_type = intf->banking_type;
 	info->banking_type = banking_type;
+	if (info->banking_type == C140_TYPE_SYSTEM21)
+		info->baserate *= 2;
 
 	//info->stream = device->machine().sound().stream_alloc(*device,0,2,info->sample_rate,info,update_stereo);
 

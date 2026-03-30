@@ -1,5 +1,7 @@
 # VGMPlay [![Build Status](https://travis-ci.org/vgmrips/vgmplay.svg?branch=master)](https://travis-ci.org/vgmrips/vgmplay)
 
+Fork by [***rigidatoms***](https://www.youtube.com/@rigid_atoms), allowing the export of samples in tracks using C140/C219 and C352. This is NOT a replacement for VGMPlay. 
+
 The official and always up-to-date player for all [VGM](https://en.wikipedia.org/wiki/VGM_(file_format)) files.
 
 In the future, the existing VGMPlay will be replaced by [libvgm](https://github.com/ValleyBell/libvgm), which is currently in development.
