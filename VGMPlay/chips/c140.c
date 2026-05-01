@@ -408,10 +408,11 @@ void c140_w(UINT8 ChipID, offs_t offset, UINT8 data)
 
 				char filebuf[32];
 				char isC219 = info->banking_type == C140_TYPE_ASIC219;
+				long smpl_addr = ((v->bank)<<16) + v->sample_start;
 				if (isC219)
-					snprintf(filebuf, 32, "c219_%08x.wav", v->sample_start);
+					snprintf(filebuf, 32, "c219_%08x.wav", smpl_addr);
 				else
-					snprintf(filebuf, 32, "c140_%08x.wav", v->sample_start);
+					snprintf(filebuf, 32, "c140_%08x.wav", smpl_addr);
 				if (!(isC219 == C140_TYPE_ASIC219 && vreg->mode & 0x04) && access(filebuf, F_OK) != 0)
 					c140_extract_sample(info, offset>>4, (vreg->frequency_msb << 8) | vreg->frequency_lsb, filebuf);
 				
